@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2017, WSO2 Inc. (http://www.wso2.org) All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.wso2.scim2.operation;
 
 import io.swagger.client.ApiClient;
@@ -8,6 +24,7 @@ import io.swagger.client.api.Scimv2UsersApi;
 import java.io.IOException;
 import java.util.*;
 
+import org.json.JSONException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.wso2.charon3.core.config.CharonConfiguration;
@@ -25,12 +42,14 @@ import org.wso2.charon3.core.schema.SCIMConstants.UserSchemaConstants;
 import org.wso2.charon3.core.schema.SCIMResourceSchemaManager;
 import org.wso2.charon3.core.schema.SCIMResourceTypeSchema;
 import org.wso2.charon3.core.utils.codeutils.FilterTreeManager;
+import org.wso2.charon3.core.utils.codeutils.PatchOperation;
 import org.wso2.scim2.client.SCIMProvider;
 import org.wso2.scim2.exception.IdentitySCIMException;
 import org.wso2.scim2.model.Error;
 import org.wso2.scim2.model.UserList;
 
 import com.google.gson.Gson;
+import org.wso2.scim2.util.PatchOperationEncoder;
 
 public class UserOperation {
 
@@ -58,10 +77,11 @@ public class UserOperation {
 
         client = new ApiClient();
         client.setUsername(userName);
+        //client.setURL(provider.getProperty("userEndpoint"));
         client.setPassword(provider.getProperty(UserSchemaConstants.PASSWORD));
     }
 
-    public User provisionCreateUser() throws IdentitySCIMException {
+    public User createUser() throws IdentitySCIMException {
 
         Gson gson;
         User user = null;
@@ -87,7 +107,6 @@ public class UserOperation {
                         .getInstance().getUserResourceSchema();
                 user = (User) jsonDecoder.decodeResource(response.getData(),
                         schema, new User());
-
             }
 
         } catch (CharonException e) {
@@ -112,37 +131,44 @@ public class UserOperation {
         return user;
     }
 
-    /*
-     * To delete the user by giving user object
-     */
-    public void provisionDeleteUser() throws IdentitySCIMException {
+    public void deleteUser() throws IdentitySCIMException {
 
         if (this.scimObject != null) {
-            User user = (User) scimObject;
+            Gson gson = new Gson();
+            String userId = null;
             try {
-                provisionDeleteUserById(user.getId());
+                String filter = USER_FILTER + ((User) scimObject).getUserName();
+                List<User> users = listWithGet(null, null, filter, 1, 1, null, null);
+                User user = users.get(0);
+
+                userId = user.getId();
+                if (userId == null) {
+                    logger.error("Trying to delete a user entry which doesn't support SCIM. " +
+                            "Usually internal carbon User entries such as admin role doesn't support SCIM 2.0 attributes.");
+                    return;
+                }
+
+                Scimv2UsersApi api = new Scimv2UsersApi(client);
+                api.deleteUser(userId);
+
             } catch (CharonException e) {
                 throw new IdentitySCIMException("Error in encoding the object", e);
+            } catch (IOException e) {
+                e.printStackTrace();
+            } catch (InternalErrorException e) {
+                throw new IdentitySCIMException(
+                        "Error in invoking provisioning operation for the use with id: "
+                                + userId, e);
+            } catch (BadRequestException e) {
+                throw new IdentitySCIMException(
+                        "Error in invoking provisioning operation for the user with id: "
+                                + userId, e);
+            } catch (ApiException e) {
+                Error err = gson.fromJson(e.getResponseBody(), Error.class);
+                throw new IdentitySCIMException(err.getDetail(), e);
+            } catch (NotFoundException e) {
+                throw new IdentitySCIMException("No resulted users found in the user store.", e);
             }
-        }
-    }
-
-    /*
-     * To delete the user by giving user Id
-     *
-     * @param Id
-     */
-    public void provisionDeleteUserById(String id) throws IdentitySCIMException {
-
-        Scimv2UsersApi api = new Scimv2UsersApi(client);
-
-        try {
-            api.deleteUser(id);
-        } catch (ApiException e) {
-            Gson gson = new Gson();
-            Error err = gson.fromJson(e.getResponseBody(), Error.class);
-            throw new IdentitySCIMException(err.getDetail(), e);
-
         }
     }
 
@@ -215,16 +241,12 @@ public class UserOperation {
                 String error = "No resulted users found in the user store.";
                 throw new NotFoundException(error);
             }
-
-        } else {
-
         }
 
         return returnedUsers;
-
     }
 
-    public User provisionUpdateUser() throws IdentitySCIMException {
+    public User updateUser(String httpMethod) throws IdentitySCIMException {
 
         Scimv2UsersApi api;
         User updatedUser = null;
@@ -241,10 +263,20 @@ public class UserOperation {
                 return updatedUser;
             }
 
-            String encodedUser = new JSONEncoder().encodeSCIMObject(scimObject);
+            String encodedObject = null;
+
+            if(httpMethod.equals("PUT")) {
+                encodedObject = new JSONEncoder().encodeSCIMObject(scimObject);
+            } else if(httpMethod.equals("PATCH")) {
+                List<PatchOperation> patchOperations = provider.getPatchOperationList();
+                encodedObject = new PatchOperationEncoder().encodeRequest(patchOperations);
+            } else {
+                logger.error("Not supported update operation type: " + httpMethod);
+            }
+
 
             api = new Scimv2UsersApi(client);
-            ApiResponse<String> response = api.updateUser(userId, null, null, encodedUser);
+            ApiResponse<String> response = api.updateUser(userId, null, null, encodedObject, httpMethod);
 
             if (response.getStatusCode() == 201) {
                 JSONDecoder jsonDecoder = new JSONDecoder();
@@ -257,7 +289,7 @@ public class UserOperation {
 
         } catch (CharonException e) {
             throw new IdentitySCIMException(
-                    "Error in encoding the object to be provisioned for user with id: "
+                    "Error in encoding the object to be provisioned for user : "
                             + userName, e);
         } catch (BadRequestException e) {
             throw new IdentitySCIMException(
@@ -269,14 +301,26 @@ public class UserOperation {
             throw new IdentitySCIMException(err.getDetail(), e);
         } catch (InternalErrorException e) {
             throw new IdentitySCIMException(
-                    "Error in invoking provisioning operation for the user with id: "
+                    "Error in invoking provisioning operation for the user : "
                             + userName, e);
         } catch (NotFoundException e) {
             throw new IdentitySCIMException("No resulted users found in the user store.", e);
         } catch (IOException e) {
             throw new IdentitySCIMException(e.getMessage(), e);
+        } catch (JSONException e) {
+            throw new IdentitySCIMException("Error while encoding patch operations");
         }
 
         return updatedUser;
+    }
+
+    public User updateUser() throws IdentitySCIMException {
+
+        return updateUser("PUT");
+    }
+
+    public User patchUser() throws IdentitySCIMException {
+
+        return updateUser("PATCH");
     }
 }
